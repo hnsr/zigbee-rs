@@ -356,6 +356,19 @@ where
     /// response means a legacy parent and leaves the NIB untouched.
     pub async fn send_end_device_timeout_request(&self) -> Result<(), NetworkError> {
         let requested_timeout = *self.nib().end_device_timeout_default();
+
+        let parent = self.parent_short_address()?;
+        log::debug!(
+            "[NWK] timeout request: parent=0x{:04x}, requested_timeout_enum={}",
+            parent.0,
+            requested_timeout,
+        );
+
+        // The IEEE address is optional until learned from received traffic.
+        if let Some(ieee) = self.neighbor_ieee_address(parent) {
+            log::debug!("[NWK] parent IEEE address: 0x{:016x}", ieee.0);
+        }
+
         let command = Command::EndDeviceTimeoutRequest(EndDeviceTimeoutRequest {
             requested_timeout,
             // all bits reserved, must be 0 (3.4.11.3.2)
@@ -363,8 +376,7 @@ where
         });
 
         let mut buf = [0u8; 256];
-        let len =
-            self.build_nwk_command_frame(self.parent_short_address()?, command, true, &mut buf)?;
+        let len = self.build_nwk_command_frame(parent, command, true, &mut buf)?;
         self.pending_timeout_request
             .store(requested_timeout, Ordering::Relaxed);
         self.mac
