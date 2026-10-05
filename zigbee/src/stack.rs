@@ -389,8 +389,8 @@ where
     /// Every end device — sleepy or `rxOnWhenIdle` — refreshes its entry in
     /// the parent's neighbor table this way, using the method the parent
     /// announced: a MAC data poll, whose retrieved frame is dispatched like in
-    /// [`Self::rx_loop`], or an End Device Timeout Request. Without a
-    /// negotiated timeout there is nothing to send and it succeeds silently.
+    /// [`Self::rx_loop`], or an End Device Timeout Request. When no timeout
+    /// was negotiated, MAC data polling is used as a fallback.
     ///
     /// `Err(NetworkError::ParentLinkFailure)` means the link is gone — the
     /// parent rejected or ignored a timeout request, or enough keepalives went
@@ -401,16 +401,18 @@ where
         let nlme = device.nlme();
         let cfg = self.config.descriptors();
         let result = match nlme.keepalive_method() {
-            // the data poll itself is the keepalive, so dispatch what it brings
-            // back instead of dropping it
-            KeepaliveMethod::MacDataPoll => {
+            // Use MAC polling when negotiated, or as a fallback when  no keepalive method
+            // was negotiated.
+            KeepaliveMethod::MacDataPoll | KeepaliveMethod::None => {
+                let fallback = nlme.keepalive_method() == KeepaliveMethod::None;
+
                 let result = device.poll_and_dispatch(cfg, handler).await;
                 if result.is_ok() {
                     nlme.refresh_parent_timeout();
                 }
                 result
             }
-            KeepaliveMethod::TimeoutRequest | KeepaliveMethod::None => nlme.send_keepalive().await,
+            KeepaliveMethod::TimeoutRequest => nlme.send_keepalive().await,
         };
         let Err(e) = result else {
             return Ok(());
