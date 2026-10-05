@@ -563,17 +563,23 @@ where
     // response by polling for it
     async fn poll_until_timeout_response(&self, retries: u8) {
         let mut buf = [0u8; 128];
-        for _ in 0..retries {
+        for attempt in 0..retries {
             if self.timeout_response.is_signaled() {
                 return;
             }
+
+            log::debug!("[NWK] timeout-response poll {}/{}", attempt + 1, retries);
+
             match self.poll_parent(&mut buf).await {
-                Ok(Some(len)) => match self.process_received_nwk_frame(&mut buf[..len]).await {
-                    Ok(Some(_)) => log::debug!("[NWK] keepalive poll dropped a data frame"),
-                    Ok(None) => (),
-                    Err(e) => log::debug!("[NWK] keepalive frame not processed: {e:?}"),
-                },
-                Ok(None) => (),
+                Ok(Some(len)) => {
+                    log::debug!("[NWK] timeout-response poll: received {len} bytes");
+                    match self.process_received_nwk_frame(&mut buf[..len]).await {
+                        Ok(Some(_)) => log::debug!("[NWK] keepalive poll dropped a data frame"),
+                        Ok(None) => (),
+                        Err(e) => log::debug!("[NWK] keepalive frame not processed: {e:?}"),
+                    }
+                }
+                Ok(None) => log::debug!("[NWK] timeout-response poll: no queued frame"),
                 Err(e) => log::debug!("[NWK] keepalive poll failed: {e:?}"),
             }
         }
