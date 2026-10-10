@@ -13,6 +13,22 @@ use crate::storage::flash::round_up;
 // upper byte of the flash map key namespaces the NIB
 const TAG: u16 = 0x0000;
 
+// Keep independent last-successful images: storing a neighbor table must not
+// invalidate the security counter headroom, or vice versa.
+pub(crate) struct Shadows {
+    security_material: Shadow,
+    neighbor_table: Shadow,
+}
+
+impl Shadows {
+    pub(crate) const fn new() -> Self {
+        Self {
+            security_material: ([0; crate::storage::flash::DATA], 0),
+            neighbor_table: ([0; crate::storage::flash::DATA], 0),
+        }
+    }
+}
+
 /// Restores all persisted NIB fields; missing or unparsable items keep
 /// their defaults.
 pub(crate) async fn restore<F: NorFlash>(map: &mut FlashMap<F>, nib: &Nib) {
@@ -32,7 +48,7 @@ pub(crate) async fn restore<F: NorFlash>(map: &mut FlashMap<F>, nib: &Nib) {
 }
 
 /// Persists all NIB fields modified since the last call.
-pub(crate) async fn flush<F: NorFlash>(map: &mut FlashMap<F>, shadow: &mut Shadow, nib: &Nib) {
+pub(crate) async fn flush<F: NorFlash>(map: &mut FlashMap<F>, shadows: &mut Shadows, nib: &Nib) {
     let dirty = nib.take_dirty();
     if dirty == 0 {
         return;
@@ -60,9 +76,6 @@ pub(crate) async fn flush<F: NorFlash>(map: &mut FlashMap<F>, shadow: &mut Shado
             let Ok(()) = map.data.write_with(&mut offset, set, byte::LE) else {
                 continue;
             };
-            if shadow.1 == offset && shadow.0[..offset] == map.data[..offset] {
-                continue;
-            }
             offset
         } else {
             let Some(len) = nib.export_field(*id, &mut map.data) else {
@@ -71,9 +84,23 @@ pub(crate) async fn flush<F: NorFlash>(map: &mut FlashMap<F>, shadow: &mut Shado
             len
         };
 
+        let shadow = match *id {
+            NibId::security_material_set => Some(&mut shadows.security_material),
+            NibId::neighbor_table => Some(&mut shadows.neighbor_table),
+            _ => None,
+        };
+        if let Some(previous) = shadow.as_ref()
+            && previous.1 == len
+            && previous.0[..len] == map.data[..len]
+        {
+            continue;
+        }
+
         let key = TAG | u16::from(key);
         if map.store(key, len).await {
-            if *id == NibId::security_material_set {
+            // Only successful writes become the baseline. On failure, the old
+            // image remains so a later flush still attempts the changed value.
+            if let Some(shadow) = shadow {
                 shadow.0[..len].copy_from_slice(&map.data[..len]);
                 shadow.1 = len;
             }

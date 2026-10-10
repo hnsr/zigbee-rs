@@ -28,8 +28,8 @@ const SCRATCH: usize = DATA + 64;
 // every map item must fit into one flash sector (4 KiB on esp32)
 const _: () = assert!(SCRATCH <= 4096);
 
-// last-stored normalized image of a counter-bearing field, used to skip
-// writes while counters stay within their stored headroom
+// Last-successfully-stored encoded image of a field. Counter-bearing fields
+// are normalized first so values within their headroom share the same image.
 pub(crate) type Shadow = ([u8; DATA], usize);
 
 // next counter value a rebooted device may use; two boundaries ahead so
@@ -91,7 +91,7 @@ pub struct FlashStorage<F: NorFlash> {
 
 struct Inner<F: NorFlash> {
     map: FlashMap<F>,
-    nib_shadow: Shadow,
+    nib_shadow: nib::storage::Shadows,
     aib_shadow: Shadow,
 }
 
@@ -116,7 +116,7 @@ pub async fn init_with_flash<F: NorFlash>(flash: F, range: Range<u32>) -> FlashS
     FlashStorage {
         inner: spin::Mutex::new(Inner {
             map,
-            nib_shadow: ([0; DATA], 0),
+            nib_shadow: nib::storage::Shadows::new(),
             aib_shadow: ([0; DATA], 0),
         }),
     }
@@ -178,14 +178,18 @@ mod tests {
     use sequential_storage::mock_flash::MockFlashBase;
     use sequential_storage::mock_flash::WriteCountCheck;
     use zigbee_types::IeeeAddress;
+    use zigbee_types::ShortAddress;
     use zigbee_types::StorageVec;
 
     use super::*;
     use crate::aps::aib::Aib;
     use crate::aps::aib::AibId;
+    use crate::nwk::nib::DeviceType;
     use crate::nwk::nib::NetworkSecurityMaterialDescriptor;
     use crate::nwk::nib::Nib;
     use crate::nwk::nib::NibId;
+    use crate::nwk::nib::NwkNeighbor;
+    use crate::nwk::nib::relationship;
 
     // 4 pages of 4 KiB, 1-byte words: mirrors the esp32-c6 layout
     type Flash = MockFlashBase<4, 1, 4096>;
@@ -229,6 +233,35 @@ mod tests {
             network_key_type: 0x01,
         });
         set
+    }
+
+    fn add_parent(nib: &Nib) {
+        nib.update_neighbor_table(|table| {
+            table
+                .push(NwkNeighbor {
+                    extended_address: IeeeAddress(0x1234),
+                    network_address: ShortAddress(0x0000),
+                    device_type: DeviceType::Coordinator,
+                    rx_on_when_idle: true,
+                    end_device_configuration: 0,
+                    relationship: relationship::PARENT,
+                    transmit_failure: 0,
+                    lqi: 200,
+                    outgoing_cost: 0,
+                    age: 0,
+                    keepalive_received: false,
+                    extended_pan_id: IeeeAddress(0x1122_3344),
+                    logical_channel: 25,
+                    depth: 0,
+                    permit_joining: false,
+                    potential_parent: 0,
+                    router_capacity: true,
+                    end_device_capacity: true,
+                    update_id: 0,
+                    pan_id: 0xabcd,
+                })
+                .unwrap();
+        });
     }
 
     #[test]
@@ -319,7 +352,7 @@ mod tests {
     fn flush_and_restore_roundtrip() {
         let (nib, aib) = fresh_ibs();
         let mut map = new_map();
-        let mut nib_shadow: Shadow = ([0; DATA], 0);
+        let mut nib_shadow = nib::storage::Shadows::new();
         let mut aib_shadow: Shadow = ([0; DATA], 0);
 
         nib.update_network_address(|value| *value = 0x1234);
@@ -342,7 +375,7 @@ mod tests {
     fn restored_outgoing_counter_is_ahead_of_any_used_value() {
         let (nib, _) = fresh_ibs();
         let mut map = new_map();
-        let mut shadow: Shadow = ([0; DATA], 0);
+        let mut shadow = nib::storage::Shadows::new();
 
         nib.update_security_material_set(|value| *value = security_material(5));
         block_on(nib::storage::flush(&mut map, &mut shadow, &nib));
@@ -365,7 +398,7 @@ mod tests {
             let flash = Flash::new(WriteCountCheck::Twice, None, true);
             let baseline = flash.stats_snapshot();
             let mut map = FlashMap::new(flash, Flash::FULL_FLASH_RANGE);
-            let mut shadow: Shadow = ([0; DATA], 0);
+            let mut shadow = nib::storage::Shadows::new();
 
             nib.update_security_material_set(|value| *value = security_material(0));
             block_on(nib::storage::flush(&mut map, &mut shadow, &nib));
@@ -384,12 +417,129 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_neighbor_table_does_not_access_flash() {
+        let (nib, _) = fresh_ibs();
+        let mut map = new_map();
+        let mut shadows = nib::storage::Shadows::new();
+        add_parent(&nib);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        let baseline = map.map.flash().stats_snapshot();
+
+        // Successful transmissions reset this counter even when already zero.
+        // The setter still marks it dirty, but persistence should do no I/O.
+        for _ in 0..100 {
+            nib.update_neighbor_table(|table| table[0].transmit_failure = 0);
+            block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        }
+
+        let delta = baseline.compare_to(map.map.flash().stats_snapshot());
+        assert_eq!(delta.reads, 0);
+        assert_eq!(delta.writes, 0);
+        assert_eq!(delta.erases, 0);
+        assert_eq!(nib.take_dirty(), 0);
+    }
+
+    #[test]
+    fn changed_neighbor_table_is_written_and_restored() {
+        let (nib, _) = fresh_ibs();
+        let mut map = new_map();
+        let mut shadows = nib::storage::Shadows::new();
+        add_parent(&nib);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        let baseline = map.map.flash().stats_snapshot();
+
+        nib.update_neighbor_table(|table| {
+            table[0].extended_address = IeeeAddress(0x5678);
+        });
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        assert!(baseline.compare_to(map.map.flash().stats_snapshot()).writes > 0);
+
+        let (restored, _) = fresh_ibs();
+        block_on(nib::storage::restore(&mut map, &restored));
+        assert_eq!(
+            restored.neighbor_table()[0].extended_address,
+            IeeeAddress(0x5678)
+        );
+    }
+
+    #[test]
+    fn clearing_neighbor_table_is_persisted() {
+        let (nib, _) = fresh_ibs();
+        let mut map = new_map();
+        let mut shadows = nib::storage::Shadows::new();
+        add_parent(&nib);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+
+        nib.update_neighbor_table(|table| table.clear());
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        let baseline = map.map.flash().stats_snapshot();
+        nib.update_neighbor_table(|table| table.clear());
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        assert_eq!(
+            baseline.compare_to(map.map.flash().stats_snapshot()).writes,
+            0
+        );
+
+        let (restored, _) = fresh_ibs();
+        add_parent(&restored);
+        block_on(nib::storage::restore(&mut map, &restored));
+        assert!(restored.neighbor_table().is_empty());
+    }
+
+    #[test]
+    fn neighbor_and_security_shadows_are_independent() {
+        let (nib, _) = fresh_ibs();
+        let mut map = new_map();
+        let mut shadows = nib::storage::Shadows::new();
+        add_parent(&nib);
+        nib.update_security_material_set(|value| *value = security_material(0));
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+
+        nib.update_neighbor_table(|table| table[0].transmit_failure = 1);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        let baseline = map.map.flash().stats_snapshot();
+
+        // Updating the neighbor image must not invalidate counter headroom.
+        nib.update_security_material_set(|value| *value = security_material(1));
+        nib.update_neighbor_table(|table| table[0].transmit_failure = 1);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        assert_eq!(
+            baseline.compare_to(map.map.flash().stats_snapshot()).writes,
+            0
+        );
+    }
+
+    #[test]
+    fn failed_neighbor_store_is_retried() {
+        let (nib, _) = fresh_ibs();
+        let mut map = new_map();
+        let mut shadows = nib::storage::Shadows::new();
+        add_parent(&nib);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+
+        nib.update_neighbor_table(|table| table[0].transmit_failure = 1);
+        map.map.flash().bytes_until_shutoff = Some(0);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        assert_eq!(nib.take_dirty(), 1 << (NibId::neighbor_table as u64));
+
+        // Retry the identical requested value after flash becomes available.
+        // If the failed write had advanced the shadow, this would be skipped.
+        map.map.flash().bytes_until_shutoff = None;
+        nib.mark_dirty(NibId::neighbor_table);
+        block_on(nib::storage::flush(&mut map, &mut shadows, &nib));
+        assert_eq!(nib.take_dirty(), 0);
+        let (restored, _) = fresh_ibs();
+        block_on(nib::storage::restore(&mut map, &restored));
+        assert_eq!(restored.neighbor_table()[0].transmit_failure, 1);
+    }
+
+    #[test]
     fn failed_store_rearms_dirty_bit() {
         let (nib, _) = fresh_ibs();
         let mut flash = Flash::new(WriteCountCheck::Twice, None, true);
         flash.bytes_until_shutoff = Some(0);
         let mut map = FlashMap::new(flash, Flash::FULL_FLASH_RANGE);
-        let mut shadow: Shadow = ([0; DATA], 0);
+        let mut shadow = nib::storage::Shadows::new();
 
         nib.update_network_address(|value| *value = 0x1234);
         block_on(nib::storage::flush(&mut map, &mut shadow, &nib));
