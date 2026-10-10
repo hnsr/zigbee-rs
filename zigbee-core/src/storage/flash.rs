@@ -80,7 +80,7 @@ impl<F: NorFlash> FlashMap<F> {
             .await
             .is_ok();
         log::debug!("Persistence END: field={key:#06x}, success={success}");
-        success;
+        success
     }
 }
 
