@@ -71,11 +71,16 @@ impl<F: NorFlash> FlashMap<F> {
 
     // persists data[..len] under key; wear-leveled and crash-safe
     pub(crate) async fn store(&mut self, key: u16, len: usize) -> bool {
+
+        log::debug!("Persistence START: field={key:#06x}, bytes={len}");
+
         let value: &[u8] = &self.data[..len];
-        self.map
+        let success = self.map
             .store_item(&mut self.scratch, &key, &value)
             .await
-            .is_ok()
+            .is_ok();
+        log::debug!("Persistence END: field={key:#06x}, success={success}");
+        success;
     }
 }
 
