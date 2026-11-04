@@ -1078,6 +1078,9 @@ where
                 // our parent has dropped us: we are no longer on the network,
                 // and the indication carries a NULL device address (3.6.1.10.3)
                 self.nib().update_extended_panid(|value| *value = 0);
+                if !options.rejoin() {
+                    self.nib().update_operating_channel(|value| *value = 0);
+                }
                 defmt_or_log::info!("[NWK] removed by parent (leave notification)");
                 self.leave_indication.signal(NlmeLeaveIndication {
                     device_address: None,
@@ -1285,6 +1288,7 @@ where
         nib.update_manager_addr(|value| *value = 0x0000);
         nib.update_update_id(|value| *value = 0x00);
         nib.update_network_address(|value| *value = NWK_UNASSIGNED_ADDRESS);
+        nib.update_operating_channel(|value| *value = 0);
         nib.update_group_idtable(|value| value.clear());
         nib.update_extended_panid(|value| *value = 0);
         nib.update_route_record_table(|value| value.clear());
@@ -2966,6 +2970,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         // 3.6.1.10.1: an end device sends the remove children sub-field as 0
         // even when the request asked for it
@@ -2982,6 +2987,7 @@ mod tests {
         assert_eq!(*nib.extended_panid(), 0);
         assert!(nib.neighbor_table().is_empty());
         assert!(nib.security_material_set().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -2993,6 +2999,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let confirm = block_on(nlme.leave(NlmeLeaveRequest {
             device_address: None,
@@ -3003,6 +3010,7 @@ mod tests {
         assert_eq!(confirm.status, NlmeLeaveStatus::MacError);
         assert_eq!(nlme.nib().network_address(), NWK_UNASSIGNED_ADDRESS);
         assert!(nlme.nib().security_material_set().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -3027,6 +3035,7 @@ mod tests {
     fn leave_notification_from_parent_raises_indication() {
         let (_guard, nlme) = make_nlme(MockMlme::new());
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0).set_rejoin(true),
@@ -3041,6 +3050,7 @@ mod tests {
                 rejoin: true,
             })
         );
+        assert_eq!(nlme.nib().operating_channel(), 25);
     }
 
     #[test]
@@ -3050,6 +3060,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let confirm = block_on(nlme.leave(NlmeLeaveRequest {
             device_address: None,
@@ -3065,6 +3076,7 @@ mod tests {
         assert_eq!(nib.network_address(), 0x1234);
         assert_eq!(*nib.extended_panid(), 0);
         assert!(!nib.neighbor_table().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 25);
     }
 
     #[test]
@@ -3095,6 +3107,7 @@ mod tests {
     fn leave_notification_from_parent_marks_device_removed() {
         let (_guard, nlme) = make_nlme(MockMlme::new());
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0),
@@ -3104,6 +3117,7 @@ mod tests {
         let nib = nlme.nib();
         assert_eq!(*nib.extended_panid(), 0);
         assert!(nib.neighbor_table().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -3113,6 +3127,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0).set_request(true),
@@ -3120,6 +3135,7 @@ mod tests {
         block_on(nlme.handle_nwk_command(&dummy_header(0x0000), Command::Leave(leave)));
 
         assert_eq!(nlme.nib().network_address(), 0xffff);
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
