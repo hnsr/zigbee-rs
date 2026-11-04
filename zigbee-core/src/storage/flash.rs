@@ -778,6 +778,7 @@ mod tests {
         let mut map = new_map();
         block_on(map.restore(&nib, &aib));
         assert_eq!(nib.network_address(), 0xffff);
+        assert_eq!(nib.operating_channel(), 0);
         assert_eq!(
             *aib.trust_center_address(),
             IeeeAddress(0xffff_ffff_ffff_ffff)
@@ -791,6 +792,7 @@ mod tests {
 
         nib.update_network_address(|value| *value = 0x1234);
         nib.update_panid(|value| *value = 0xabcd);
+        nib.update_operating_channel(|value| *value = 25);
         nib.update_extended_panid(|value| *value = 0x1122_3344_5566_7788);
         aib.update_trust_center_address(|value| *value = IeeeAddress(0xdead_beef));
         block_on(map.flush(&nib, CounterPrecision::Quantized));
@@ -800,6 +802,7 @@ mod tests {
         block_on(map.restore(&nib2, &aib2));
         assert_eq!(nib2.network_address(), 0x1234);
         assert_eq!(nib2.panid(), 0xabcd);
+        assert_eq!(nib2.operating_channel(), 25);
         assert_eq!(*nib2.extended_panid(), 0x1122_3344_5566_7788);
         assert_eq!(*aib2.trust_center_address(), IeeeAddress(0xdead_beef));
     }
