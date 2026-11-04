@@ -17,7 +17,8 @@ pub struct NetworkConfig {
     /// Extended PAN id to join, rejoin, or steer onto.
     pub extended_pan_id: IeeeAddress,
     /// Channels scanned when joining, and when looking for a new parent
-    /// (3.6.1.4.2). The first one is the operating channel.
+    /// (3.6.1.4.2). The first one is the initial channel, also used on
+    /// startup if no valid joined channel was restored from storage.
     pub channels: core::ops::Range<u8>,
     /// Scan duration exponent used for those scans.
     pub scan_duration: u8,
@@ -113,7 +114,10 @@ impl<'a> StackConfig<'a> {
         &self.descriptors
     }
 
-    /// The operating channel: the first of the configured channels.
+    /// Initial/fallback channel: the first of the configured scan channels.
+    ///
+    /// This is configuration, not the current radio channel. A joined device
+    /// resumes on its persisted operating channel when that value is valid.
     pub fn channel(&self) -> u8 {
         self.network.channels.start
     }

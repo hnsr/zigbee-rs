@@ -403,12 +403,24 @@ where
     /// A device that was reset while joined keeps its addresses in the NIB but
     /// the radio comes up unconfigured: the PAN id, short address, channel and
     /// the filtering that goes with membership have to be applied before it
-    /// can poll its parent again. A device that is not on a network only gets
-    /// the channel it will look for one on, leaving the rest to the join.
-    pub async fn resume(&self, channel: u8) -> bool {
+    /// can poll its parent again. A joined device uses its saved operating
+    /// channel when it is valid (11..26).
+    ///
+    /// `fallback_channel` is used when the device is not on a network, or
+    /// when the saved channel is unknown or invalid. This also supports
+    /// flash records written before channel persistence was added. Selecting
+    /// the fallback does not overwrite the saved channel; a successful join
+    /// or rejoin records the channel actually used.
+    pub async fn resume(&self, fallback_channel: u8) -> bool {
         let nib = self.nib();
         let network_address = nib.network_address();
         let on_a_network = network_address != NWK_UNASSIGNED_ADDRESS;
+        let saved_channel = nib.operating_channel();
+        let channel = if on_a_network && (11..=26).contains(&saved_channel) {
+            saved_channel
+        } else {
+            fallback_channel
+        };
 
         let config = if on_a_network {
             MacConfig::joined(channel, PanId(nib.panid()), ShortAddress(network_address))
@@ -2014,6 +2026,79 @@ mod tests {
         (guard, Nlme::new(mac))
     }
 
+    #[test]
+    fn resume_restores_the_saved_channel_and_addresses() {
+        for saved_channel in [11, 25, 26] {
+            let mut mac = MockMlme::new();
+            mac.expect_configure()
+                .times(1)
+                .withf(move |config| {
+                    config.channel == Some(saved_channel)
+                        && config.pan_id == Some(PanId(0xAAAA))
+                        && config.short_address == Some(ShortAddress(0x1234))
+                })
+                .returning(|_| ());
+
+            let (_guard, nlme) = make_nlme(mac);
+            seed_joined_nib(&nlme);
+            nlme.nib()
+                .update_operating_channel(|value| *value = saved_channel);
+
+            // a broad scan range can start on a channel different from the saved one
+            assert!(block_on(nlme.resume(15)));
+            assert_eq!(nlme.current_channel.load(Ordering::Relaxed), saved_channel);
+            assert_eq!(nlme.nib().operating_channel(), saved_channel);
+        }
+    }
+
+    #[test]
+    fn resume_uses_the_fallback_when_the_saved_channel_is_unknown_or_invalid() {
+        for saved_channel in [0, 10, 27, 255] {
+            let mut mac = MockMlme::new();
+            mac.expect_configure()
+                .times(1)
+                .withf(|config| {
+                    config.channel == Some(11)
+                        && config.pan_id == Some(PanId(0xAAAA))
+                        && config.short_address == Some(ShortAddress(0x1234))
+                })
+                .returning(|_| ());
+
+            let (_guard, nlme) = make_nlme(mac);
+            seed_joined_nib(&nlme);
+            // zero is also the default when an older flash record has no channel field
+            nlme.nib()
+                .update_operating_channel(|value| *value = saved_channel);
+
+            assert!(block_on(nlme.resume(11)));
+            assert_eq!(nlme.current_channel.load(Ordering::Relaxed), 11);
+            assert_eq!(nlme.nib().network_address(), 0x1234);
+            // resuming alone must not persist a channel that has not succeeded yet
+            assert_eq!(nlme.nib().operating_channel(), saved_channel);
+        }
+    }
+
+    #[test]
+    fn resume_without_membership_uses_the_initial_channel() {
+        let mut mac = MockMlme::new();
+        mac.expect_configure()
+            .times(1)
+            .withf(|config| {
+                config.channel == Some(11)
+                    && config.pan_id.is_none()
+                    && config.short_address.is_none()
+            })
+            .returning(|_| ());
+
+        let (_guard, nlme) = make_nlme(mac);
+        nlme.nib().update_operating_channel(|value| *value = 25);
+
+        assert!(!block_on(nlme.resume(11)));
+        assert_eq!(nlme.current_channel.load(Ordering::Relaxed), 11);
+        assert_eq!(nlme.nib().network_address(), NWK_UNASSIGNED_ADDRESS);
+        assert_eq!(nlme.nib().operating_channel(), 25);
+    }
+
     fn default_join_request(epid: u64) -> NlmeJoinRequest {
         NlmeJoinRequest {
             extended_pan_id: IeeeAddress(epid),
@@ -2558,7 +2643,7 @@ mod tests {
         let mut mac = MockMlme::new();
         mac.expect_configure()
             .times(1)
-            .withf(|config| config.channel == Some(25))
+            .withf(|config| config.channel == Some(20))
             .returning(|_| ());
         mac.expect_transmit_data()
             .times(1)
@@ -2595,15 +2680,15 @@ mod tests {
         seed_joined_nib(&nlme);
         nlme.nib().update_operating_channel(|value| *value = 20);
         assert!(block_on(nlme.resume(25)));
-        // selecting a radio channel alone does not persist a successful join
+        // The saved channel takes precedence over the configured fallback.
         assert_eq!(nlme.nib().operating_channel(), 20);
 
         let confirm = block_on(nlme.join(rejoin_request(0xDEAD)));
         assert_eq!(confirm.status, NlmeJoinStatus::Success);
         assert_eq!(confirm.network_address, ShortAddress(0x5678));
         assert_eq!(nlme.nib().network_address(), 0x5678);
-        assert_eq!(confirm.channel, 25);
-        assert_eq!(nlme.nib().operating_channel(), 25);
+        assert_eq!(confirm.channel, 20);
+        assert_eq!(nlme.nib().operating_channel(), 20);
     }
 
     #[test]

@@ -185,8 +185,9 @@ where
     ///
     /// A device reset while joined keeps its addresses but comes up with an
     /// unconfigured radio; this applies the PAN id, short address and channel
-    /// so it can resume where it left off instead of re-commissioning.
-    /// [`Self::run`] and [`Self::commission`] do this for you.
+    /// so it can resume where it left off instead of re-commissioning. The
+    /// configured initial channel is the fallback when no valid operating
+    /// channel was saved. [`Self::run`] and [`Self::commission`] do this for you.
     pub async fn resume(&self) -> bool {
         let resuming = self.device.nlme().resume(self.config.channel()).await;
         if resuming {
