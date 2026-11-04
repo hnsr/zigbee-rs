@@ -144,6 +144,9 @@ impl From<byte::Error> for NetworkError {
 pub struct Nlme<M> {
     mac: M,
     nwk_seq: AtomicU8,
+    // last explicitly selected radio channel; zero means unknown (e.g. during a scan).
+    // failed parent candidates may retune the radio without changing the saved channel
+    current_channel: AtomicU8,
     // requested timeout enum awaiting a response (3.6.10.2); 0xff = none
     pending_timeout_request: AtomicU8,
     // remaining time before the parent is assumed to have aged this device out
@@ -200,6 +203,7 @@ where
         Self {
             mac,
             nwk_seq,
+            current_channel: AtomicU8::new(0),
             pending_timeout_request: AtomicU8::new(NO_PENDING_TIMEOUT),
             parent_timeout_remaining_ms: AtomicU32::new(PARENT_TIMEOUT_INACTIVE),
             rejoin_response: Signal::new(),
@@ -399,12 +403,24 @@ where
     /// A device that was reset while joined keeps its addresses in the NIB but
     /// the radio comes up unconfigured: the PAN id, short address, channel and
     /// the filtering that goes with membership have to be applied before it
-    /// can poll its parent again. A device that is not on a network only gets
-    /// the channel it will look for one on, leaving the rest to the join.
-    pub async fn resume(&self, channel: u8) -> bool {
+    /// can poll its parent again. A joined device uses its saved operating
+    /// channel when it is valid (11..26).
+    ///
+    /// `fallback_channel` is used when the device is not on a network, or
+    /// when the saved channel is unknown or invalid. This also supports
+    /// flash records written before channel persistence was added. Selecting
+    /// the fallback does not overwrite the saved channel; a successful join
+    /// or rejoin records the channel actually used.
+    pub async fn resume(&self, fallback_channel: u8) -> bool {
         let nib = self.nib();
         let network_address = nib.network_address();
         let on_a_network = network_address != NWK_UNASSIGNED_ADDRESS;
+        let saved_channel = nib.operating_channel();
+        let channel = if on_a_network && (11..=26).contains(&saved_channel) {
+            saved_channel
+        } else {
+            fallback_channel
+        };
 
         let config = if on_a_network {
             MacConfig::joined(channel, PanId(nib.panid()), ShortAddress(network_address))
@@ -412,6 +428,7 @@ where
             MacConfig::channel(channel)
         };
         self.mac.configure(config).await;
+        self.current_channel.store(channel, Ordering::Relaxed);
 
         on_a_network
     }
@@ -1061,6 +1078,9 @@ where
                 // our parent has dropped us: we are no longer on the network,
                 // and the indication carries a NULL device address (3.6.1.10.3)
                 self.nib().update_extended_panid(|value| *value = 0);
+                if !options.rejoin() {
+                    self.nib().update_operating_channel(|value| *value = 0);
+                }
                 defmt_or_log::info!("[NWK] removed by parent (leave notification)");
                 self.leave_indication.signal(NlmeLeaveIndication {
                     device_address: None,
@@ -1268,6 +1288,7 @@ where
         nib.update_manager_addr(|value| *value = 0x0000);
         nib.update_update_id(|value| *value = 0x00);
         nib.update_network_address(|value| *value = NWK_UNASSIGNED_ADDRESS);
+        nib.update_operating_channel(|value| *value = 0);
         nib.update_group_idtable(|value| value.clear());
         nib.update_extended_panid(|value| *value = 0);
         nib.update_route_record_table(|value| value.clear());
@@ -1289,6 +1310,9 @@ where
         channels: core::ops::Range<u8>,
         duration: u8,
     ) -> Result<NlmeNetworkDiscoveryConfirm, NetworkError> {
+        // scanning retunes the radio; a join or parent selection will establish
+        // its channel again. the last successful network channel stays persisted.
+        self.current_channel.store(0, Ordering::Relaxed);
         let scan_result = self
             .mac
             .scan_network(ScanType::Active, channels, duration)
@@ -1442,6 +1466,7 @@ where
             let dest = Address::Short(pan_id, MacShortAddress(neighbor.network_address.0));
             drop(table);
 
+            self.current_channel.store(0, Ordering::Relaxed);
             match self.mac.associate(channel, dest, mac_caps).await {
                 Ok(response) => {
                     match response.status {
@@ -1454,6 +1479,9 @@ where
                             self.nib()
                                 .update_extended_panid(|value| *value = joined_epid.0);
                             self.nib().update_panid(|value| *value = pan_id.0);
+                            self.current_channel.store(channel, Ordering::Relaxed);
+                            self.nib()
+                                .update_operating_channel(|value| *value = channel);
 
                             // read parent fields before the clearing loop
                             // zeroes them (3.6.1.4.1.1)
@@ -1580,8 +1608,12 @@ where
         let mut last_status = NlmeJoinStatus::InvalidRequest;
         if let Ok(parent) = self.parent_short_address() {
             match self.rejoin_via_parent(parent, &request).await {
-                // the channel is whatever the radio is already tuned to
-                Ok(response) => return self.rejoin_confirm(response, &request, 0).await,
+                Ok(response) => {
+                    // no scan occurred: use the channel selected by resume,
+                    // association, or a previous parent-selection attempt
+                    let channel = self.current_channel.load(Ordering::Relaxed);
+                    return self.rejoin_confirm(response, &request, channel).await;
+                }
                 Err(status) => {
                     defmt_or_log::debug!("[NWK-REJOIN] remembered parent failed ({:?})", status);
                     last_status = status;
@@ -1699,6 +1731,14 @@ where
                 .update_extended_panid(|value| *value = request.extended_pan_id.0);
         }
 
+        // commit the candidate channel only after its rejoin succeeded, a caller
+        // that configured the MAC directly may leave the current channel unknown;
+        // do not replace a previously saved channel with `0`
+        if channel != 0 {
+            self.nib()
+                .update_operating_channel(|value| *value = channel);
+        }
+
         NlmeJoinConfirm {
             status: NlmeJoinStatus::Success,
             network_address: response.network_address,
@@ -1746,6 +1786,7 @@ where
         nib.update_panid(|value| *value = pan_id);
         nib.update_update_id(|value| *value = update_id);
         self.mac.configure(MacConfig::channel(channel)).await;
+        self.current_channel.store(channel, Ordering::Relaxed);
 
         Some((parent, channel))
     }
@@ -2011,6 +2052,79 @@ mod tests {
         (guard, Nlme::new(mac))
     }
 
+    #[test]
+    fn resume_restores_the_saved_channel_and_addresses() {
+        for saved_channel in [11, 25, 26] {
+            let mut mac = MockMlme::new();
+            mac.expect_configure()
+                .times(1)
+                .withf(move |config| {
+                    config.channel == Some(saved_channel)
+                        && config.pan_id == Some(PanId(0xAAAA))
+                        && config.short_address == Some(ShortAddress(0x1234))
+                })
+                .returning(|_| ());
+
+            let (_guard, nlme) = make_nlme(mac);
+            seed_joined_nib(&nlme);
+            nlme.nib()
+                .update_operating_channel(|value| *value = saved_channel);
+
+            // a broad scan range can start on a channel different from the saved one
+            assert!(block_on(nlme.resume(15)));
+            assert_eq!(nlme.current_channel.load(Ordering::Relaxed), saved_channel);
+            assert_eq!(nlme.nib().operating_channel(), saved_channel);
+        }
+    }
+
+    #[test]
+    fn resume_uses_the_fallback_when_the_saved_channel_is_unknown_or_invalid() {
+        for saved_channel in [0, 10, 27, 255] {
+            let mut mac = MockMlme::new();
+            mac.expect_configure()
+                .times(1)
+                .withf(|config| {
+                    config.channel == Some(11)
+                        && config.pan_id == Some(PanId(0xAAAA))
+                        && config.short_address == Some(ShortAddress(0x1234))
+                })
+                .returning(|_| ());
+
+            let (_guard, nlme) = make_nlme(mac);
+            seed_joined_nib(&nlme);
+            // zero is also the default when an older flash record has no channel field
+            nlme.nib()
+                .update_operating_channel(|value| *value = saved_channel);
+
+            assert!(block_on(nlme.resume(11)));
+            assert_eq!(nlme.current_channel.load(Ordering::Relaxed), 11);
+            assert_eq!(nlme.nib().network_address(), 0x1234);
+            // resuming alone must not persist a channel that has not succeeded yet
+            assert_eq!(nlme.nib().operating_channel(), saved_channel);
+        }
+    }
+
+    #[test]
+    fn resume_without_membership_uses_the_initial_channel() {
+        let mut mac = MockMlme::new();
+        mac.expect_configure()
+            .times(1)
+            .withf(|config| {
+                config.channel == Some(11)
+                    && config.pan_id.is_none()
+                    && config.short_address.is_none()
+            })
+            .returning(|_| ());
+
+        let (_guard, nlme) = make_nlme(mac);
+        nlme.nib().update_operating_channel(|value| *value = 25);
+
+        assert!(!block_on(nlme.resume(11)));
+        assert_eq!(nlme.current_channel.load(Ordering::Relaxed), 11);
+        assert_eq!(nlme.nib().network_address(), NWK_UNASSIGNED_ADDRESS);
+        assert_eq!(nlme.nib().operating_channel(), 25);
+    }
+
     fn default_join_request(epid: u64) -> NlmeJoinRequest {
         NlmeJoinRequest {
             extended_pan_id: IeeeAddress(epid),
@@ -2236,9 +2350,9 @@ mod tests {
         let (_guard, nlme) = make_nlme(mac);
 
         let mut table = StorageVec::new();
-        table
-            .push(make_neighbor(0xAAAA, 0x0000, 0xDEAD, 200, 0))
-            .unwrap();
+        let mut parent = make_neighbor(0xAAAA, 0x0000, 0xDEAD, 200, 0);
+        parent.logical_channel = 25;
+        table.push(parent).unwrap();
         nlme.nib().update_neighbor_table(|value| *value = table);
 
         let confirm = block_on(nlme.join(default_join_request(0xDEAD)));
@@ -2246,7 +2360,8 @@ mod tests {
         assert_eq!(confirm.status, NlmeJoinStatus::Success);
         assert_eq!(confirm.network_address.0, 0x1234);
         assert_eq!(confirm.extended_pan_id.0, 0xDEAD);
-        assert_eq!(confirm.channel, 11);
+        assert_eq!(confirm.channel, 25);
+        assert_eq!(nlme.nib().operating_channel(), 25);
 
         assert_eq!(nlme.nib().network_address(), 0x1234);
         assert_eq!(*nlme.nib().extended_panid(), 0xDEAD);
@@ -2386,6 +2501,7 @@ mod tests {
         });
 
         let (_guard, nlme) = make_nlme(mac);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let mut table = StorageVec::new();
         table
@@ -2396,6 +2512,7 @@ mod tests {
         let confirm = block_on(nlme.join(default_join_request(0xDEAD)));
         assert_eq!(confirm.status, NlmeJoinStatus::PanAccessDenied);
         assert_eq!(confirm.network_address.0, 0xffff);
+        assert_eq!(nlme.nib().operating_channel(), 25);
     }
 
     #[test]
@@ -2535,17 +2652,25 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        // No resume/configuration was observed by NLME in this test.
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         // a wildcard rejoin resolves to the remembered network (3.6.1.4.2)
         let confirm = block_on(nlme.join(rejoin_request(0)));
         assert_eq!(confirm.status, NlmeJoinStatus::Success);
         assert_eq!(confirm.extended_pan_id.0, 0xDEAD);
+        assert_eq!(confirm.channel, 0);
+        assert_eq!(nlme.nib().operating_channel(), 25);
         assert_eq!(*nlme.nib().extended_panid(), 0xDEAD);
     }
 
     #[test]
     fn nwk_rejoin_success_sends_request_and_updates_address() {
         let mut mac = MockMlme::new();
+        mac.expect_configure()
+            .times(1)
+            .withf(|config| config.channel == Some(20))
+            .returning(|_| ());
         mac.expect_transmit_data()
             .times(1)
             .withf(|dest, payload| {
@@ -2579,11 +2704,17 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 20);
+        assert!(block_on(nlme.resume(25)));
+        // The saved channel takes precedence over the configured fallback.
+        assert_eq!(nlme.nib().operating_channel(), 20);
 
         let confirm = block_on(nlme.join(rejoin_request(0xDEAD)));
         assert_eq!(confirm.status, NlmeJoinStatus::Success);
         assert_eq!(confirm.network_address, ShortAddress(0x5678));
         assert_eq!(nlme.nib().network_address(), 0x5678);
+        assert_eq!(confirm.channel, 20);
+        assert_eq!(nlme.nib().operating_channel(), 20);
     }
 
     #[test]
@@ -2861,6 +2992,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         // 3.6.1.10.1: an end device sends the remove children sub-field as 0
         // even when the request asked for it
@@ -2877,6 +3009,7 @@ mod tests {
         assert_eq!(*nib.extended_panid(), 0);
         assert!(nib.neighbor_table().is_empty());
         assert!(nib.security_material_set().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -2888,6 +3021,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let confirm = block_on(nlme.leave(NlmeLeaveRequest {
             device_address: None,
@@ -2898,6 +3032,7 @@ mod tests {
         assert_eq!(confirm.status, NlmeLeaveStatus::MacError);
         assert_eq!(nlme.nib().network_address(), NWK_UNASSIGNED_ADDRESS);
         assert!(nlme.nib().security_material_set().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -2922,6 +3057,7 @@ mod tests {
     fn leave_notification_from_parent_raises_indication() {
         let (_guard, nlme) = make_nlme(MockMlme::new());
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0).set_rejoin(true),
@@ -2936,6 +3072,7 @@ mod tests {
                 rejoin: true,
             })
         );
+        assert_eq!(nlme.nib().operating_channel(), 25);
     }
 
     #[test]
@@ -2945,6 +3082,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let confirm = block_on(nlme.leave(NlmeLeaveRequest {
             device_address: None,
@@ -2960,6 +3098,7 @@ mod tests {
         assert_eq!(nib.network_address(), 0x1234);
         assert_eq!(*nib.extended_panid(), 0);
         assert!(!nib.neighbor_table().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 25);
     }
 
     #[test]
@@ -2990,6 +3129,7 @@ mod tests {
     fn leave_notification_from_parent_marks_device_removed() {
         let (_guard, nlme) = make_nlme(MockMlme::new());
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0),
@@ -2999,6 +3139,7 @@ mod tests {
         let nib = nlme.nib();
         assert_eq!(*nib.extended_panid(), 0);
         assert!(nib.neighbor_table().is_empty());
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -3008,6 +3149,7 @@ mod tests {
 
         let (_guard, nlme) = make_nlme(mac);
         seed_joined_nib(&nlme);
+        nlme.nib().update_operating_channel(|value| *value = 25);
 
         let leave = Leave {
             command_options: LeaveCommandOptions(0).set_request(true),
@@ -3015,6 +3157,7 @@ mod tests {
         block_on(nlme.handle_nwk_command(&dummy_header(0x0000), Command::Leave(leave)));
 
         assert_eq!(nlme.nib().network_address(), 0xffff);
+        assert_eq!(nlme.nib().operating_channel(), 0);
     }
 
     #[test]
@@ -3385,6 +3528,59 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn rejoin_via_candidate_only_saves_channel_on_success() {
+        for (status, expected_status, saved_channel) in [
+            (0x00, NlmeJoinStatus::Success, 20),
+            (0x01, NlmeJoinStatus::PanAtCapacity, 25),
+        ] {
+            let mut mac = MockMlme::new();
+            mac.expect_configure()
+                .times(1)
+                .withf(|config| config.channel == Some(20))
+                .returning(|_| ());
+            if status == 0x00 {
+                mac.expect_configure()
+                    .times(1)
+                    .withf(|config| config.short_address == Some(ShortAddress(0x5678)))
+                    .returning(|_| ());
+            }
+            mac.expect_transmit_data()
+                .times(1)
+                .withf(|dest, _| *dest == Address::Short(PanId(0xAAAA), MacShortAddress(0x1234)))
+                .returning(|_, _| Ok(()));
+            mac.expect_poll_data().times(1).returning(move |_, buf| {
+                let response = encrypted_rejoin_response(0x5678, status);
+                buf[..response.len()].copy_from_slice(&response);
+                Ok((response.len(), 200))
+            });
+
+            let (_guard, nlme) = make_nlme(mac);
+            seed_joined_nib(&nlme);
+            nlme.nib().update_operating_channel(|value| *value = 25);
+            let mut candidate = make_neighbor(0xAAAA, 0x1234, 0xDEAD, 200, 1);
+            candidate.logical_channel = 20;
+            nlme.nib().update_neighbor_table(|table| {
+                table.push(candidate).unwrap();
+            });
+
+            // parent selection retunes the radio, but a rejected candidate must
+            // not replace the last successfully joined channel in flash
+            assert_eq!(
+                block_on(nlme.adopt_parent(1)),
+                Some((ShortAddress(0x1234), 20))
+            );
+            assert_eq!(nlme.nib().operating_channel(), 25);
+
+            let confirm = block_on(nlme.join(rejoin_request(0xDEAD)));
+            assert_eq!(confirm.status, expected_status);
+            assert_eq!(nlme.nib().operating_channel(), saved_channel);
+            if status == 0x00 {
+                assert_eq!(confirm.channel, 20);
+            }
+        }
     }
 
     #[test]
