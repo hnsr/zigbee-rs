@@ -301,6 +301,12 @@ construct_ib! {
         #[storage_key = 2]
         #[setter = update_panid]
         panid: u16 = 0xffff,
+        /// Last successfully joined network channel (implementation-specific saved radio state)
+        /// Zero means unknown, including when restoring flash written before this field existed
+        #[cell = atomic]
+        #[storage_key = 42]
+        #[setter = update_operating_channel]
+        operating_channel: u8 = 0,
         #[cell = atomic]
         #[setter = update_tx_total]
         tx_total: u16 = 0x0000,
@@ -590,6 +596,7 @@ mod tests {
         assert!(nib.unique_addr());
         assert!(!nib.time_stamp());
         assert_eq!(nib.panid(), 0xffff);
+        assert_eq!(nib.operating_channel(), 0);
         assert_eq!(nib.tx_total(), 0x0000);
         assert!(nib.leave_request_allowed());
         assert_eq!(nib.parent_information(), 0x00);

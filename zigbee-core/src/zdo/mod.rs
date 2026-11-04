@@ -231,14 +231,15 @@ impl<M: Mlme> ZigbeeDevice<M> {
     }
 
     /// Forgets the joined network so the next boot re-commissions: clears the
-    /// network address, the network key and the link keys negotiated with the
-    /// Trust Center.
+    /// network address, the saved operating channel, the network key and the
+    /// link keys negotiated with the Trust Center.
     ///
     /// With flash-backed information bases, flush the storage before
     /// resetting so this state survives the reboot.
     pub fn forget_network(&self) {
         let nib = nib::get_ref();
         nib.update_network_address(|value| *value = 0xffff);
+        nib.update_operating_channel(|value| *value = 0);
         nib.update_security_material_set(|set| set.clear());
         // the counters are keyed by key sequence number, so they die with the keys
         nib.update_incoming_frame_counters(|set| set.clear());
@@ -1385,6 +1386,25 @@ mod tests {
             ..Config::default()
         };
         ZigbeeDevice::new(config, nlme)
+    }
+
+    #[test]
+    fn forget_network_clears_saved_operating_channel() {
+        let _guard = TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        nib::try_init();
+        nib::reset();
+        aib::try_init();
+        let device = make_device(LogicalType::EndDevice);
+        let nib = nib::get_ref();
+        nib.update_network_address(|value| *value = OUR_NWK_ADDR);
+        nib.update_operating_channel(|value| *value = 25);
+
+        device.forget_network();
+
+        assert_eq!(nib.network_address(), 0xffff);
+        assert_eq!(nib.operating_channel(), 0);
     }
 
     // 2.4.3.1.3-2.4.3.1.6: seq, NWKAddrOfInterest
